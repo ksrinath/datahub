@@ -4,9 +4,9 @@ import static com.linkedin.metadata.Constants.*;
 import static com.linkedin.metadata.utils.GenericRecordUtils.serializeAspect;
 import static io.datahubproject.iceberg.catalog.Utils.*;
 
-import com.google.common.util.concurrent.Striped;
 import com.linkedin.common.AuditStamp;
 import com.linkedin.common.FabricType;
+import com.linkedin.common.Status;
 import com.linkedin.common.urn.DatasetUrn;
 import com.linkedin.common.urn.Urn;
 import com.linkedin.data.template.RecordTemplate;
@@ -15,6 +15,8 @@ import com.linkedin.dataset.IcebergCatalogInfo;
 import com.linkedin.entity.EnvelopedAspect;
 import com.linkedin.events.metadata.ChangeType;
 import com.linkedin.metadata.entity.EntityService;
+import com.linkedin.metadata.entity.RollbackResult;
+import com.linkedin.metadata.entity.RollbackRunResult;
 import com.linkedin.mxe.MetadataChangeProposal;
 import com.linkedin.platformresource.PlatformResourceInfo;
 import com.linkedin.secret.DataHubSecretValue;
@@ -24,7 +26,6 @@ import io.datahubproject.metadata.context.OperationContext;
 import io.datahubproject.metadata.services.SecretService;
 import java.net.URISyntaxException;
 import java.util.*;
-import java.util.concurrent.locks.Lock;
 import lombok.Getter;
 import lombok.SneakyThrows;
 import org.apache.iceberg.CatalogUtil;
@@ -46,10 +47,6 @@ public class DataHubIcebergWarehouse {
   private final IcebergWarehouseInfo icebergWarehouse;
 
   @Getter private final String platformInstance;
-
-  // TODO: Need to handle locks for deployments with multiple GMS replicas.
-  private static final Striped<Lock> resourceLocks =
-      Striped.lazyWeakLock(Runtime.getRuntime().availableProcessors() * 2);
 
   private DataHubIcebergWarehouse(
       String platformInstance,
@@ -184,23 +181,30 @@ public class DataHubIcebergWarehouse {
     }
   }
 
+  @SneakyThrows
   public boolean deleteDataset(TableIdentifier tableIdentifier) {
     Urn resourceUrn = resourceUrn(tableIdentifier);
-
-    // guard against concurrent modifications that depend on the resource (rename table/view)
-    Lock lock = resourceLocks.get(resourceUrn);
-    lock.lock();
-    try {
-      if (!entityService.exists(operationContext, resourceUrn)) {
-        return false;
-      }
-      Optional<DatasetUrn> urn = getDatasetUrn(tableIdentifier);
-      entityService.deleteUrn(operationContext, resourceUrn);
-      urn.ifPresent(x -> entityService.deleteUrn(operationContext, x));
-      return true;
-    } finally {
-      lock.unlock();
+    Optional<RollbackResult> deleteResult =
+        entityService.deleteAspect(
+            operationContext,
+            resourceUrn.toString(),
+            PLATFORM_RESOURCE_INFO_ASPECT_NAME,
+            Map.of(),
+            true);
+    if (deleteResult.isEmpty()
+        || deleteResult.get().isNoOp()
+        || deleteResult.get().oldValue == null) {
+      return false;
     }
+    entityService.deleteUrn(operationContext, resourceUrn);
+
+    PlatformResourceInfo platformResourceInfo = (PlatformResourceInfo) deleteResult.get().oldValue;
+
+    RollbackRunResult datasetDeleteResult =
+        entityService.deleteUrn(
+            operationContext, Urn.createFromString(platformResourceInfo.getPrimaryKey()));
+
+    return datasetDeleteResult.rowsDeletedFromEntityDeletion > 0;
   }
 
   public DatasetUrn createDataset(
@@ -211,45 +215,89 @@ public class DataHubIcebergWarehouse {
     return datasetUrn;
   }
 
+  @SneakyThrows
   public DatasetUrn renameDataset(
       TableIdentifier fromTableId, TableIdentifier toTableId, boolean view, AuditStamp auditStamp) {
 
-    // guard against concurrent modifications to the resource (other renames, deletion)
-    Lock lock = resourceLocks.get(resourceUrn(fromTableId));
-    lock.lock();
+    /*
+     1. stage-create toResource without info-aspect; fail if already exists
+     2. delete fromResource.info; fail if doesn't exist
+     3. populate toResource.info
+     4. delete fromResource-urn
+    */
+
+    Urn fromResourceUrn = resourceUrn(fromTableId);
+    Urn toResourceUrn = resourceUrn(toTableId);
+
+    // Step 1: stage the destination resource
+    MetadataChangeProposal createStatusMcp =
+        new MetadataChangeProposal()
+            .setEntityUrn(toResourceUrn)
+            .setEntityType(PLATFORM_RESOURCE_ENTITY_NAME)
+            .setAspectName(STATUS_ASPECT_NAME)
+            .setChangeType(ChangeType.CREATE_ENTITY)
+            .setAspect(serializeAspect(new Status().setRemoved(false)));
 
     try {
-      Optional<DatasetUrn> optDatasetUrn = getDatasetUrn(fromTableId);
-      if (optDatasetUrn.isEmpty()) {
-        if (view) {
-          throw new NoSuchViewException(
-              "No such view %s", fullTableName(platformInstance, fromTableId));
-        } else {
-          throw new NoSuchTableException(
-              "No such table %s", fullTableName(platformInstance, fromTableId));
-        }
-      }
-
-      DatasetUrn datasetUrn = optDatasetUrn.get();
-      try {
-        createResource(datasetUrn, toTableId, view, auditStamp);
-      } catch (ValidationException e) {
-        throw new AlreadyExistsException(
-            "%s already exists: %s",
-            view ? "View" : "Table", fullTableName(platformInstance, toTableId));
-      }
-      entityService.deleteUrn(operationContext, resourceUrn(fromTableId));
-      return datasetUrn;
-    } finally {
-      lock.unlock();
+      entityService.ingestProposal(operationContext, createStatusMcp, auditStamp, false);
+    } catch (ValidationException e) {
+      throw new AlreadyExistsException(
+          "%s already exists: %s",
+          view ? "View" : "Table", fullTableName(platformInstance, toTableId));
     }
+
+    // Step 2: delete fromResource.info
+    Optional<RollbackResult> deleteResult =
+        entityService.deleteAspect(
+            operationContext,
+            fromResourceUrn.toString(),
+            PLATFORM_RESOURCE_INFO_ASPECT_NAME,
+            Map.of(),
+            true);
+
+    if (deleteResult.isEmpty()
+        || deleteResult.get().isNoOp()
+        || deleteResult.get().oldValue == null) {
+      // source doesn't exist, so clear the staged destination and quit
+      entityService.deleteUrn(operationContext, toResourceUrn);
+
+      if (view) {
+        throw new NoSuchViewException(
+            "No such view %s", fullTableName(platformInstance, fromTableId));
+      } else {
+        throw new NoSuchTableException(
+            "No such table %s", fullTableName(platformInstance, fromTableId));
+      }
+    }
+
+    // Step 3: populate destinationResource.info
+    PlatformResourceInfo platformResourceInfo = (PlatformResourceInfo) deleteResult.get().oldValue;
+
+    DatasetUrn datasetUrn = DatasetUrn.createFromString(platformResourceInfo.getPrimaryKey());
+    MetadataChangeProposal platformResourceInfoMcp =
+        new MetadataChangeProposal()
+            .setEntityUrn(toResourceUrn)
+            .setEntityType(PLATFORM_RESOURCE_ENTITY_NAME)
+            .setAspectName(PLATFORM_RESOURCE_INFO_ASPECT_NAME)
+            .setChangeType(ChangeType.UPSERT)
+            .setAspect(serializeAspect(platformResourceInfo));
+    entityService.ingestProposal(operationContext, platformResourceInfoMcp, auditStamp, false);
+
+    // Step 4: delete fromResource urn
+    entityService.deleteUrn(operationContext, fromResourceUrn);
+    return datasetUrn;
+  }
+
+  private PlatformResourceInfo platformResourceInfo(DatasetUrn datasetUrn, boolean view) {
+    return new PlatformResourceInfo()
+        .setPrimaryKey(datasetUrn.toString())
+        .setResourceType(view ? "icebergView" : "icebergTable");
   }
 
   private void createResource(
       DatasetUrn datasetUrn, TableIdentifier tableIdentifier, boolean view, AuditStamp auditStamp) {
-    PlatformResourceInfo resourceInfo =
-        new PlatformResourceInfo().setPrimaryKey(datasetUrn.toString());
-    resourceInfo.setResourceType(view ? "icebergView" : "icebergTable");
+
+    PlatformResourceInfo resourceInfo = platformResourceInfo(datasetUrn, view);
 
     MetadataChangeProposal mcp = new MetadataChangeProposal();
     mcp.setEntityUrn(resourceUrn(tableIdentifier));
