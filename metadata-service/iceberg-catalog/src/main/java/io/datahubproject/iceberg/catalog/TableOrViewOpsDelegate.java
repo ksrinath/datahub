@@ -117,11 +117,7 @@ abstract class TableOrViewOpsDelegate<M> {
     }
 
     if (!creation && existingDatasetAspect == null) {
-      throw new IllegalStateException(
-          "Iceberg metadata aspect not found for "
-              + tableIdentifier
-              + " with base metadata-file "
-              + base.location());
+      throw noSuchEntityException();
     }
 
     DatasetUrn datasetUrn;
